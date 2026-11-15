@@ -1,176 +1,209 @@
-/* Extract X.509 certificate in DER form from PKCS#11 or PEM.
- *
- * Copyright © 2014-2015 Red Hat, Inc. All Rights Reserved.
- * Copyright © 2015      Intel Corporation.
- *
- * Authors: David Howells <dhowells@redhat.com>
- *          David Woodhouse <dwmw2@infradead.org>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public License
- * as published by the Free Software Foundation; either version 2.1
- * of the licence, or (at your option) any later version.
+
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Extract X.509 certificates from a PEM file.
  */
-#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
 #include <err.h>
+
+#include <openssl/opensslv.h>
 #include <openssl/bio.h>
 #include <openssl/pem.h>
 #include <openssl/err.h>
+#include <openssl/x509.h>
+
+#if OPENSSL_VERSION_NUMBER < 0x40000000L && !defined(OPENSSL_IS_BORINGSSL)
 #include <openssl/engine.h>
+#endif
 
-/*
- * OpenSSL 3.0 deprecates the OpenSSL's ENGINE API.
- *
- * Remove this if/when that API is no longer used
- */
+#if OPENSSL_VERSION_NUMBER < 0x40000000L
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
 
-#define PKEY_ID_PKCS7 2
+static char *key_pass;
+static BIO *wb;
+static const char *cert_dst;
+static bool kbuild_verbose;
 
-static __attribute__((noreturn))
-void format(void)
-{
-	fprintf(stderr,
-		"Usage: scripts/extract-cert <source> <dest>\n");
-	exit(2);
-}
-
-static void display_openssl_errors(int l)
+static void display_openssl_errors(void)
 {
 	const char *file;
-	char buf[120];
-	int e, line;
+	const char *func;
+	const char *data;
+	int line;
+	int flags;
+	unsigned long e;
 
-	if (ERR_peek_error() == 0)
-		return;
-	fprintf(stderr, "At main.c:%d:\n", l);
-
-	while ((e = ERR_get_error_line(&file, &line))) {
-		ERR_error_string(e, buf);
-		fprintf(stderr, "- SSL %s: %s:%d\n", buf, file, line);
+	while ((e = ERR_get_error_all(&file, &line, &func,
+				      &data, &flags))) {
+		if (kbuild_verbose) {
+			fprintf(stderr,
+				"OpenSSL error: %s:%d: %s\n",
+				file ? file : "unknown",
+				line,
+				ERR_error_string(e, NULL));
+			if (func)
+				fprintf(stderr, "  Function: %s\n", func);
+			if (data && (flags & ERR_TXT_STRING))
+				fprintf(stderr, "  Data: %s\n", data);
+		}
 	}
 }
 
-#ifndef OPENSSL_IS_BORINGSSL
-static void drain_openssl_errors(void)
-{
-	const char *file;
-	int line;
-
-	if (ERR_peek_error() == 0)
-		return;
-	while (ERR_get_error_line(&file, &line)) {}
-}
-#endif
-
-#define ERR(cond, fmt, ...)				\
-	do {						\
-		bool __cond = (cond);			\
-		display_openssl_errors(__LINE__);	\
-		if (__cond) {				\
-			err(1, fmt, ## __VA_ARGS__);	\
-		}					\
-	} while(0)
-
-static const char *key_pass;
-static BIO *wb;
-static char *cert_dst;
-int kbuild_verbose;
+#define ERR(cond, fmt, ...)					\
+	do {							\
+		if (cond) {					\
+			display_openssl_errors();		\
+			err(1, fmt, ##__VA_ARGS__);		\
+		}						\
+	} while (0)
 
 static void write_cert(X509 *x509)
 {
-	char buf[200];
-
 	if (!wb) {
 		wb = BIO_new_file(cert_dst, "wb");
-		ERR(!wb, "%s", cert_dst);
+		ERR(!wb, "Can't open certificate output file %s",
+		    cert_dst);
 	}
-	X509_NAME_oneline(X509_get_subject_name(x509), buf, sizeof(buf));
-	ERR(!i2d_X509_bio(wb, x509), "%s", cert_dst);
-	if (kbuild_verbose)
-		fprintf(stderr, "Extracted cert: %s\n", buf);
+
+	ERR(!i2d_X509_bio(wb, x509),
+	    "Can't write certificate to %s", cert_dst);
+
+	if (kbuild_verbose) {
+		char *name = X509_NAME_oneline(
+			X509_get_subject_name(x509), NULL, 0);
+
+		if (name) {
+			fprintf(stderr, "Extracted certificate: %s\n", name);
+			OPENSSL_free(name);
+		}
+	}
+}
+
+static int pem_password_callback(char *buf, int size, int rwflag,
+				 void *userdata)
+{
+	(void)rwflag;
+	(void)userdata;
+
+	if (!key_pass)
+		return 0;
+
+	if ((int)strlen(key_pass) >= size)
+		return 0;
+
+	memcpy(buf, key_pass, strlen(key_pass));
+	return strlen(key_pass);
 }
 
 int main(int argc, char **argv)
 {
-	char *cert_src;
+	BIO *b;
+	X509 *cert;
+	const char *cert_src;
+	const char *verbose_env;
+	const char *pass_env;
+
+	(void)argc;
 
 	OpenSSL_add_all_algorithms();
-	ERR_load_crypto_strings();
 	ERR_clear_error();
 
-	kbuild_verbose = atoi(getenv("KBUILD_VERBOSE")?:"0");
+	verbose_env = getenv("KBUILD_VERBOSE");
+	kbuild_verbose = verbose_env && atoi(verbose_env);
 
-        key_pass = getenv("KBUILD_SIGN_PIN");
-
-	if (argc != 3)
-		format();
+	pass_env = getenv("KBUILD_SIGN_PIN");
+	if (pass_env)
+		key_pass = strdup(pass_env);
 
 	cert_src = argv[1];
 	cert_dst = argv[2];
 
-	if (!cert_src[0]) {
-		/* Invoked with no input; create empty file */
-		FILE *f = fopen(cert_dst, "wb");
-		ERR(!f, "%s", cert_dst);
-		fclose(f);
-		exit(0);
-	} else if (!strncmp(cert_src, "pkcs11:", 7)) {
-#ifdef OPENSSL_IS_BORINGSSL
-		ERR(1, "BoringSSL does not support extracting from PKCS#11");
-		exit(1);
-#else
+	if (!cert_src || !cert_dst)
+		errx(1, "Usage: extract-cert <cert_src> <cert_dst>");
+
+	if (!strcmp(cert_src, ""))
+	{
+		wb = BIO_new_file(cert_dst, "wb");
+		ERR(!wb, "Can't create empty certificate file %s", cert_dst);
+		BIO_free(wb);
+		return 0;
+	}
+
+#if !defined(OPENSSL_IS_BORINGSSL)
+	if (!strncmp(cert_src, "pkcs11:", 7)) {
+#if OPENSSL_VERSION_NUMBER < 0x40000000L
 		ENGINE *e;
 		struct {
 			const char *cert_id;
-			X509 *cert;
-		} parms;
-
-		parms.cert_id = cert_src;
-		parms.cert = NULL;
+			const char *key_id;
+		} parms = {
+			.cert_id = cert_src,
+			.key_id = NULL,
+		};
 
 		ENGINE_load_builtin_engines();
-		drain_openssl_errors();
 		e = ENGINE_by_id("pkcs11");
-		ERR(!e, "Load PKCS#11 ENGINE");
-		if (ENGINE_init(e))
-			drain_openssl_errors();
-		else
-			ERR(1, "ENGINE_init");
+		ERR(!e, "Load PKCS#11 engine");
+
+		ERR(!ENGINE_init(e), "Initialize PKCS#11 engine");
+
 		if (key_pass)
-			ERR(!ENGINE_ctrl_cmd_string(e, "PIN", key_pass, 0), "Set PKCS#11 PIN");
-		ENGINE_ctrl_cmd(e, "LOAD_CERT_CTRL", 0, &parms, NULL, 1);
-		ERR(!parms.cert, "Get X.509 from PKCS#11");
-		write_cert(parms.cert);
+			ERR(!ENGINE_ctrl_cmd_string(e, "PIN", key_pass, 0),
+			    "Set PKCS#11 PIN");
+
+		cert = ENGINE_load_certificate(e, parms.cert_id, NULL, NULL);
+		ERR(!cert, "Load certificate from PKCS#11");
+
+		write_cert(cert);
+		X509_free(cert);
+
+		ENGINE_finish(e);
+		ENGINE_free(e);
+#else
+		errx(1,
+		     "PKCS#11 certificates are not supported with OpenSSL 4.x");
 #endif
-	} else {
-		BIO *b;
-		X509 *x509;
+		goto out;
+	}
+#endif
 
-		b = BIO_new_file(cert_src, "rb");
-		ERR(!b, "%s", cert_src);
+	b = BIO_new_file(cert_src, "rb");
+	ERR(!b, "Can't open certificate file %s", cert_src);
 
-		while (1) {
-			x509 = PEM_read_bio_X509(b, NULL, NULL, NULL);
-			if (wb && !x509) {
-				unsigned long err = ERR_peek_last_error();
-				if (ERR_GET_LIB(err) == ERR_LIB_PEM &&
-				    ERR_GET_REASON(err) == PEM_R_NO_START_LINE) {
-					ERR_clear_error();
-					break;
-				}
+	for (;;) {
+		cert = PEM_read_bio_X509(b, NULL,
+					 pem_password_callback, NULL);
+
+		if (!cert) {
+			unsigned long e = ERR_peek_last_error();
+
+			if (wb && ERR_GET_LIB(e) == ERR_LIB_PEM &&
+			    ERR_GET_REASON(e) == PEM_R_NO_START_LINE) {
+				ERR_clear_error();
+				break;
 			}
-			ERR(!x509, "%s", cert_src);
-			write_cert(x509);
+
+			BIO_free(b);
+			ERR(1, "Can't parse certificate file %s", cert_src);
 		}
+
+		write_cert(cert);
+		X509_free(cert);
 	}
 
-	BIO_free(wb);
+	BIO_free(b);
+
+out:
+	if (wb)
+		BIO_free(wb);
+
+	free(key_pass);
 
 	return 0;
 }
